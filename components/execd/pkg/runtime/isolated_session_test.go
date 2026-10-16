@@ -19,6 +19,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/alibaba/opensandbox/execd/pkg/isolation"
+	"github.com/stretchr/testify/require"
 )
 
 // stubIsolator returns Available=true but Wrap is a no-op (for happy-path tests).
@@ -693,6 +695,59 @@ func TestRunInIsolatedSession_MultiLine(t *testing.T) {
 		if lines[i] != want {
 			t.Errorf("line[%d] = %q, want %q", i, lines[i], want)
 		}
+	}
+}
+
+func TestRunInIsolatedSession_LongOutput(t *testing.T) {
+	runner := newTestRunner(t)
+	workspace := t.TempDir()
+	output := strings.Repeat("x", 32*1024*1024)
+	outputPath := filepath.Join(workspace, "long-line")
+	require.NoError(t, os.WriteFile(outputPath, []byte(output), 0600))
+	id, err := runner.CreateIsolatedSession(&IsolatedSessionOptions{
+		WorkspacePath: workspace, WorkspaceMode: "rw",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = runner.DeleteIsolatedSession(id) })
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var lines []string
+	code := "cat " + shellEscape(outputPath) + "\nprintf '\\r\\n\\n'\ncat " + shellEscape(outputPath) + " >&2\nfalse"
+	err = runner.RunInIsolatedSession(ctx, id, code, nil, func(line string) { lines = append(lines, line) })
+	require.EqualError(t, err, "command exited with code 1")
+	require.Len(t, lines, 3)
+	require.True(t, lines[0] == output, "long stdout was changed")
+	require.Empty(t, lines[1])
+	require.True(t, lines[2] == output, "long stderr before the end marker was changed")
+
+	lines = nil
+	require.NoError(t, runner.RunInIsolatedSession(ctx, id, "echo next", nil, func(line string) { lines = append(lines, line) }))
+	require.Equal(t, []string{"next"}, lines)
+}
+
+func TestScanUntilMarker_LongUnterminatedLine(t *testing.T) {
+	const marker = "__ISOLATED_RUN_END__test"
+	output := strings.Repeat("x", 32*1024*1024)
+	for _, withMarker := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing marker", true: "marker at EOF"}[withMarker], func(t *testing.T) {
+			input := output
+			if withMarker {
+				input += marker + " 7"
+			}
+			var lines []string
+			code, err := scanUntilMarker(context.Background(), io.NopCloser(strings.NewReader(input)), marker, func(line string) {
+				lines = append(lines, line)
+			})
+			require.Len(t, lines, 1)
+			require.True(t, lines[0] == output, "unterminated long output was changed")
+			if withMarker {
+				require.NoError(t, err)
+				require.Equal(t, 7, code)
+			} else {
+				require.ErrorContains(t, err, "without end marker")
+			}
+		})
 	}
 }
 
