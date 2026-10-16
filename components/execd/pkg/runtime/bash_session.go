@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -53,6 +54,27 @@ const (
 	exitMarkerPrefix   = "__EXIT_CODE__:"
 	pwdMarkerPrefix    = "__PWD__:"
 )
+
+// readOutputLines preserves ScanLines framing without a fixed token-size limit.
+// Returning false from onLine stops reading after the current line.
+func readOutputLines(input io.Reader, onLine func(string) bool) error {
+	reader := bufio.NewReaderSize(input, 64*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if !onLine(line) {
+				return nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
 
 func (c *Controller) createBashSession(req *CreateContextRequest) (string, error) {
 	resolvedCwd, err := pathutil.ExpandPath(req.Cwd)
@@ -241,15 +263,12 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		return fmt.Errorf("start %s: %w", shell, err)
 	}
 	// The child holds its own copy of the write end; closing ours lets the
-	// scanner below see EOF as soon as the child (and its descendants that
+	// reader below see EOF as soon as the child (and its descendants that
 	// inherited stdout) exit.
 	_ = stdoutW.Close()
 	defer stdoutR.Close()
 	defer s.untrackCurrentProcess()
 	s.trackCurrentProcess(cmd.Process.Pid)
-
-	scanner := bufio.NewScanner(stdoutR)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 	var (
 		envLines []string
@@ -258,8 +277,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		inEnv    bool
 	)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	readErr := readOutputLines(stdoutR, func(line string) bool {
 		switch {
 		case line == envDumpStartMarker:
 			inEnv = true
@@ -274,20 +292,20 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		default:
 			if inEnv {
 				envLines = append(envLines, line)
-				continue
+				return true
 			}
 			if request.Hooks.OnExecuteStdout != nil {
 				request.Hooks.OnExecuteStdout(line)
 			}
 		}
-	}
+		return true
+	})
 
-	scanErr := scanner.Err()
 	waitErr := mp.Wait()
 
-	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, log.SanitizeCommand(request.Code))
-		return fmt.Errorf("read stdout: %w", scanErr)
+	if readErr != nil {
+		log.Error("read stdout failed: %v (command: %q)", readErr, log.SanitizeCommand(request.Code))
+		return fmt.Errorf("read stdout: %w", readErr)
 	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {

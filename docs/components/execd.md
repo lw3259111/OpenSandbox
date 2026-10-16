@@ -72,6 +72,12 @@ Bash session API (which keeps its existing name for compatibility), and
 isolated sessions. Commands submitted to a fallback session must use syntax
 supported by that image's `sh` implementation.
 
+Shell session stdout and stderr have no fixed per-line length limit in either
+Bash or isolated sessions. Output remains line-oriented: LF or CRLF delimiters
+are removed, empty lines are preserved, and a final unterminated line is
+delivered at EOF or before the isolated session's end marker. Each line is
+buffered in memory until it completes.
+
 ## PTY WebSocket access
 
 The first WebSocket attached to `/pty/{session_id}/ws` is the exclusive

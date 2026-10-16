@@ -20,8 +20,12 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +34,42 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
+
+func TestReadOutputLines_Framing(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "empty"},
+		{name: "blank lines", input: "\n\n", want: []string{"", ""}},
+		{name: "CRLF", input: "first\r\n\r\nlast\r\n", want: []string{"first", "", "last"}},
+		{name: "unterminated", input: "first\nlast", want: []string{"first", "last"}},
+		{name: "trailing CR", input: "last\r", want: []string{"last"}},
+		{name: "embedded CR", input: "first\rlast\n", want: []string{"first\rlast"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var lines []string
+			require.NoError(t, readOutputLines(strings.NewReader(tt.input), func(line string) bool {
+				lines = append(lines, line)
+				return true
+			}))
+			require.Equal(t, tt.want, lines)
+		})
+	}
+}
+
+func TestReadOutputLines_ReadError(t *testing.T) {
+	readErr := fmt.Errorf("pipe read failed")
+	input := io.MultiReader(strings.NewReader("last"), iotest.ErrReader(readErr))
+	var lines []string
+	err := readOutputLines(input, func(line string) bool {
+		lines = append(lines, line)
+		return true
+	})
+	require.ErrorIs(t, err, readErr)
+	require.Equal(t, []string{"last"}, lines)
+}
 
 func TestBashSession_NonZeroExitEmitsError(t *testing.T) {
 	requireBash(t)
@@ -394,6 +434,59 @@ func TestBashSession_envLargeOutputChained(t *testing.T) {
 	require.True(t, containsLine(lines3, "FINAL_FOO=hello1_next") && containsLine(lines3, "FINAL_BAR=bar1_last"), "final env lines missing, got %v", lines3[len(lines3)-5:])
 	require.Equal(t, 3, initCalls, "OnExecuteInit expected 3 calls")
 	require.Equal(t, 3, completeCalls, "OnExecuteComplete expected 3 calls")
+}
+
+func TestBashSession_LongOutput(t *testing.T) {
+	requireBash(t)
+	output := strings.Repeat("x", 32*1024*1024)
+	outputPath := filepath.Join(t.TempDir(), "long-line")
+	require.NoError(t, os.WriteFile(outputPath, []byte(output), 0600))
+
+	for _, stream := range []string{"stdout", "stderr"} {
+		for _, eof := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/eof=%t", stream, eof), func(t *testing.T) {
+				session := newBashSession("")
+				t.Cleanup(func() { _ = session.close() })
+				require.NoError(t, session.start())
+				targetDir := t.TempDir()
+				code := "cat " + shellEscape(outputPath)
+				if stream == "stderr" {
+					code += " >&2"
+				}
+				if eof {
+					code += "\nexit 0"
+				} else {
+					code += "\nprintf '\\r\\n\\n'\nexport LONG_OUTPUT_VALUE=preserved\ncd " + shellEscape(targetDir) + "\nfalse"
+				}
+				var lines []string
+				var executionError *execute.ErrorOutput
+				completeCalls := 0
+				require.NoError(t, session.run(context.Background(), &ExecuteCodeRequest{
+					Code: code, Timeout: 15 * time.Second,
+					Hooks: ExecuteResultHook{
+						OnExecuteStdout:   func(line string) { lines = append(lines, line) },
+						OnExecuteError:    func(err *execute.ErrorOutput) { executionError = err },
+						OnExecuteComplete: func(time.Duration) { completeCalls++ },
+					},
+				}))
+				require.NotEmpty(t, lines)
+				require.Len(t, lines[0], len(output))
+				require.True(t, lines[0] == output, "long output was changed")
+				if eof {
+					require.Len(t, lines, 1)
+					require.Nil(t, executionError)
+					require.Equal(t, 1, completeCalls)
+				} else {
+					require.Equal(t, []string{"", ""}, lines[1:])
+					require.NotNil(t, executionError)
+					require.Equal(t, "1", executionError.EValue)
+					require.Equal(t, 0, completeCalls)
+					require.Equal(t, "preserved", session.env["LONG_OUTPUT_VALUE"])
+					require.Equal(t, targetDir, session.cwd)
+				}
+			})
+		}
+	}
 }
 
 func TestBashSession_cwdPersistsWithoutOverride(t *testing.T) {

@@ -17,7 +17,6 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -639,16 +638,13 @@ func (r *IsolatedRunner) RunInIsolatedSession(ctx context.Context, id string, co
 // scanUntilMarker reads stdout lines until the end marker is found.
 // Returns the exit code from the marker line.
 func scanUntilMarker(ctx context.Context, stdout io.ReadCloser, runMarker string, onStdout StdoutCallback) (int, error) {
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
 	var exitCode int
+	var readErr error
 	markerSeen := false
 	scanDone := make(chan struct{})
 	go func() {
 		defer close(scanDone)
-		for scanner.Scan() {
-			line := scanner.Text()
+		readErr = readOutputLines(stdout, func(line string) bool {
 			// The marker may appear mid-line if the previous command's
 			// output didn't end with a newline (e.g. cat of a file
 			// without trailing newline).
@@ -664,25 +660,26 @@ func scanUntilMarker(ctx context.Context, stdout io.ReadCloser, runMarker string
 						exitCode = code
 					}
 				}
-				return
+				return false
 			}
 			if onStdout != nil {
 				onStdout(line)
 			}
-		}
+			return true
+		})
 	}()
 
 	select {
 	case <-scanDone:
 	case <-ctx.Done():
-		// Wait for scanner goroutine to finish so it doesn't consume the
+		// Wait for reader goroutine to finish so it doesn't consume the
 		// next run's output on the shared stdout pipe.
 		<-scanDone
 		return 0, ctx.Err()
 	}
 
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("read stdout: %w", err)
+	if readErr != nil {
+		return 0, fmt.Errorf("read stdout: %w", readErr)
 	}
 	if !markerSeen {
 		return 1, fmt.Errorf("session process exited without end marker (process may have died or called exit)")
